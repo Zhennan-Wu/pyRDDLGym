@@ -288,7 +288,11 @@ class RDDLSimulator:
     def sample_reward(self) -> float:
         '''Samples the current reward given the current state and action.'''
         return float(self._sample(self.rddl.reward, self.subs))
-    
+
+    def density_reward(self) -> float:
+        '''Return the current reward parameter given the current state and action.'''
+        return float(self._density(self.rddl.reward, self.subs))
+        
     def reset(self) -> Union[Dict[str, None], Args]:
         '''Resets the state variables to their initial values.'''
         rddl = self.rddl
@@ -343,7 +347,44 @@ class RDDLSimulator:
         
         done = self.check_terminal_states()        
         return obs, reward, done
+
+    def dbn_step(self, actions: Args) -> Args:
+        '''Samples and returns the next state from the CPF expressions.
         
+        :param actions: a dict mapping current action fluent to their values
+        '''
+        rddl = self.rddl
+        actions = self._process_actions(actions)
+        subs = self.subs
+        subs.update(actions)
+        
+        # evaluate CPFs in topological order
+        for (cpf, expr, dtype) in self.cpfs:
+            sample = self._density(expr, subs)
+            # RDDLSimulator._check_type(sample, dtype, cpf, expr)
+            subs[cpf] = sample
+        
+        # evaluate reward
+        reward = self.density_reward()
+        
+        # # update state
+        # self.state = {}
+        # for (state, next_state) in rddl.next_state.items():
+        #     subs[state] = subs[next_state]
+        #     self.state.update(rddl.ground_values(state, subs[state]))
+        
+        # # update observation
+        # if self._pomdp: 
+        #     obs = {}
+        #     for var in rddl.observ:
+        #         obs.update(rddl.ground_values(var, subs[var]))
+        # else:
+        #     obs = self.state
+        
+        # done = self.check_terminal_states()        
+        # return obs, reward, done
+        return subs, reward
+
     # ===========================================================================
     # start of sampling subroutines
     # ===========================================================================
@@ -1178,6 +1219,891 @@ class RDDLSimulator:
         sample = np.moveaxis(sample, source=(-2, -1), destination=indices)
         return sample        
 
+
+    # ===========================================================================
+    # start of density estimation subroutines
+    # ===========================================================================
+    
+    def _density(self, expr, subs):
+        etype, _ = expr.etype
+        if etype == 'constant':
+            return self._density_constant(expr, subs)
+        elif etype == 'pvar':
+            return self._density_pvar(expr, subs)
+        elif etype == 'arithmetic':
+            return self._density_arithmetic(expr, subs)
+        elif etype == 'relational':
+            return self._density_relational(expr, subs)
+        elif etype == 'boolean':
+            return self._density_logical(expr, subs)
+        elif etype == 'aggregation':
+            return self._density_aggregation(expr, subs)
+        elif etype == 'func':
+            return self._density_func(expr, subs)
+        elif etype == 'control':
+            return self._density_control(expr, subs)
+        elif etype == 'randomvar':
+            return self._density_random(expr, subs)
+        elif etype == 'randomvector':
+            return self._density_random_vector(expr, subs)
+        elif etype == 'matrix':
+            return self._density_matrix(expr, subs)
+        else:
+            raise RDDLNotImplementedError(
+                f'Internal error: expression type {etype} is not supported.\n' + 
+                print_stack_trace(expr))
+                
+    # ===========================================================================
+    # leaves
+    # ===========================================================================
+        
+    def _density_constant(self, expr, _):
+        return self.traced.cached_sim_info(expr)
+    
+    def _density_pvar(self, expr, subs):
+        var, args = expr.args
+        
+        # free variable (e.g., ?x) and object converted to canonical index
+        is_value, cached_info = self.traced.cached_sim_info(expr)
+        if is_value:
+            return cached_info
+        
+        # extract variable value
+        sample = subs.get(var, None)
+        if sample is None:
+            raise RDDLUndefinedVariableError(
+                f'Variable <{var}> is referenced before assignment.\n' + 
+                print_stack_trace(expr))
+        
+        # lifted domain must slice and/or reshape value tensor
+        if cached_info is not None:
+            slices, axis, shape, op_code, op_args = cached_info
+            if slices: 
+                if op_code == RDDLObjectsTracer.NUMPY_OP_CODE.NESTED_SLICE:
+                    slices = tuple(
+                        (self._density(arg, subs) if _slice is None else _slice)
+                        for (arg, _slice) in zip(args, slices)
+                    )
+                sample = sample[slices]
+            if axis:
+                sample = np.expand_dims(sample, axis=axis)
+                sample = np.broadcast_to(sample, shape=shape)
+            if op_code == RDDLObjectsTracer.NUMPY_OP_CODE.EINSUM:
+                sample = np.einsum(sample, *op_args)
+            elif op_code == RDDLObjectsTracer.NUMPY_OP_CODE.TRANSPOSE:
+                sample = np.transpose(sample, axes=op_args)
+        return sample
+    
+    # ===========================================================================
+    # arithmetic
+    # ===========================================================================
+    
+    def _density_arithmetic(self, expr, subs):
+        _, op = expr.etype
+        numpy_op = RDDLSimulator._check_op(
+            op, self.ARITHMETIC_OPS, 'Arithmetic', expr)
+        
+        args = expr.args        
+        n = len(args)
+        
+        # unary negation
+        if n == 1 and op == '-':
+            arg, = args
+            return -1 * self._density(arg, subs)
+        
+        # binary operator: for * try to short-circuit if possible
+        elif n == 2:
+            lhs, rhs = args
+            if op == '*':
+                return self._density_product(lhs, rhs, subs)
+            else:
+                sample_lhs = 1 * self._density(lhs, subs)
+                sample_rhs = 1 * self._density(rhs, subs)
+                try:
+                    return numpy_op(sample_lhs, sample_rhs)
+                except:
+                    raise ArithmeticError(
+                        f'Cannot evaluate arithmetic operation {op} '
+                        f'at {sample_lhs} and {sample_rhs}.\n' + 
+                        print_stack_trace(expr))
+        
+        # for a grounded domain can short-circuit * and +
+        elif n > 0 and not self.traced.cached_objects_in_scope(expr):
+            if op == '*':
+                return self._density_product_grounded(args, subs)
+            elif op == '+':
+                return sum(1 * self._density(arg, subs) for arg in args)
+        
+        raise RDDLInvalidNumberOfArgumentsError(
+            f'Arithmetic operator {op} does not have the required '
+            f'number of arguments.\n' + print_stack_trace(expr))
+    
+    def _density_product(self, lhs, rhs, subs):
+        
+        # prioritize simple expressions
+        if rhs.is_constant_expression() or rhs.is_pvariable_expression():
+            lhs, rhs = rhs, lhs
+            
+        sample_lhs = 1 * self._density(lhs, subs)
+        
+        # short circuit if all zero
+        if not np.any(sample_lhs):
+            return sample_lhs
+            
+        sample_rhs = self._density(rhs, subs)
+        return sample_lhs * sample_rhs
+    
+    def _density_product_grounded(self, args, subs):
+        prod = 1
+        
+        # go through simple expressions first
+        for arg in args: 
+            if arg.is_constant_expression() or arg.is_pvariable_expression():
+                sample = self._density(arg, subs)
+                prod *= sample
+                if prod == 0:
+                    return prod
+        
+        # go through complex expressions last
+        for arg in args: 
+            if not (arg.is_constant_expression() or arg.is_pvariable_expression()):
+                sample = self._density(arg, subs)
+                prod *= sample
+                if prod == 0:
+                    return prod
+                
+        return prod
+        
+    # ===========================================================================
+    # boolean
+    # ===========================================================================
+    
+    def _density_relational(self, expr, subs):
+        _, op = expr.etype
+        numpy_op = RDDLSimulator._check_op(
+            op, self.RELATIONAL_OPS, 'Relational', expr)
+        
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, op, expr)
+        
+        lhs, rhs = args
+        sample_lhs = 1 * self._density(lhs, subs)
+        sample_rhs = 1 * self._density(rhs, subs)
+        return numpy_op(sample_lhs, sample_rhs)
+    
+    def _density_logical(self, expr, subs):
+        _, op = expr.etype
+        if op == '&':
+            op = '^'
+        numpy_op = RDDLSimulator._check_op(op, self.LOGICAL_OPS, 'Logical', expr)
+        
+        args = expr.args
+        n = len(args)
+        
+        if n == 1 and op == '~':
+            arg, = args
+            sample = self._density(arg, subs)
+            RDDLSimulator._check_type(sample, bool, op, expr, arg='')
+            return np.logical_not(sample)
+        
+        # try to short-circuit ^ and | if possible
+        elif n == 2:
+            lhs, rhs = args
+            if op == '^' or op == '|':
+                return self._density_and_or(lhs, rhs, op, expr, subs)
+            else:
+                sample_lhs = self._density(lhs, subs)
+                sample_rhs = self._density(rhs, subs)
+                RDDLSimulator._check_type(sample_lhs, bool, op, expr, arg=1)
+                RDDLSimulator._check_type(sample_rhs, bool, op, expr, arg=2)
+                return numpy_op(sample_lhs, sample_rhs)
+        
+        # for a grounded domain, we can short-circuit ^ and |
+        elif n > 0 and (op == '^' or op == '|') \
+        and not self.traced.cached_objects_in_scope(expr):
+            return self._density_and_or_grounded(args, op, expr, subs)
+            
+        raise RDDLInvalidNumberOfArgumentsError(
+            f'Logical operator {op} does not have the required '
+            f'number of arguments.\n' + print_stack_trace(expr))
+    
+    def _density_and_or(self, lhs, rhs, op, expr, subs):
+        
+        # prioritize simple expressions
+        if rhs.is_constant_expression() or rhs.is_pvariable_expression():
+            lhs, rhs = rhs, lhs 
+            
+        sample_lhs = self._density(lhs, subs)
+        RDDLSimulator._check_type(sample_lhs, bool, op, expr, arg=1)
+        
+        # short-circuit if all True/False
+        if (op == '^' and not np.any(sample_lhs)) \
+        or (op == '|' and np.all(sample_lhs)):
+            return sample_lhs
+            
+        sample_rhs = self._density(rhs, subs)
+        RDDLSimulator._check_type(sample_rhs, bool, op, expr, arg=2)
+        
+        if op == '^':
+            return np.logical_and(sample_lhs, sample_rhs)
+        else:
+            return np.logical_or(sample_lhs, sample_rhs)
+    
+    def _density_and_or_grounded(self, args, op, expr, subs): 
+        use_and = op == '^'
+        
+        # go through simple expressions first
+        for (i, arg) in enumerate(args):
+            if arg.is_constant_expression() or arg.is_pvariable_expression():
+                sample = self._density(arg, subs)
+                RDDLSimulator._check_type(sample, bool, op, expr, arg=i + 1)
+                sample = bool(sample)
+                if use_and and not sample:
+                    return False
+                elif not use_and and sample:
+                    return True
+        
+        # go through complex expressions last
+        for (i, arg) in enumerate(args):
+            if not (arg.is_constant_expression() or arg.is_pvariable_expression()):
+                sample = self._density(arg, subs)
+                RDDLSimulator._check_type(sample, bool, op, expr, arg=i + 1)
+                sample = bool(sample)
+                if use_and and not sample:
+                    return False
+                elif not use_and and sample:
+                    return True
+            
+        return use_and
+            
+    # ===========================================================================
+    # aggregation
+    # ===========================================================================
+    
+    def _density_aggregation(self, expr, subs):
+        _, op = expr.etype
+        numpy_op = RDDLSimulator._check_op(
+            op, self.AGGREGATION_OPS, 'Aggregation', expr)
+        
+        # sample the argument and aggregate over the reduced axes
+        * _, arg = expr.args
+        sample = self._density(arg, subs)                
+        if op == 'forall' or op == 'exists':
+            RDDLSimulator._check_type(sample, bool, op, expr, arg='')
+        else:
+            sample = 1 * sample
+        _, axes = self.traced.cached_sim_info(expr)
+        return numpy_op(sample, axis=axes)
+     
+    # ===========================================================================
+    # function
+    # ===========================================================================
+    
+    def _density_func(self, expr, subs):
+        _, name = expr.etype
+        args = expr.args
+        
+        # unary function
+        unary_op = self.UNARY.get(name, None)
+        if unary_op is not None:
+            RDDLSimulator._check_arity(args, 1, name, expr)
+            arg, = args
+            sample = 1 * self._density(arg, subs)
+            try:
+                return unary_op(sample)
+            except:
+                raise ArithmeticError(
+                    f'Cannot evaluate unary function {name} at {sample}.\n' + 
+                    print_stack_trace(expr))
+        
+        # binary function
+        binary_op = self.BINARY.get(name, None)
+        if binary_op is not None:
+            RDDLSimulator._check_arity(args, 2, name, expr)
+            lhs, rhs = args
+            sample_lhs = 1 * self._density(lhs, subs)
+            sample_rhs = 1 * self._density(rhs, subs)
+            try:
+                return binary_op(sample_lhs, sample_rhs)
+            except:
+                raise ArithmeticError(
+                    f'Cannot evaluate binary function {name} at '
+                    f'{sample_lhs} and {sample_rhs}.\n' + print_stack_trace(expr))
+        
+        raise RDDLNotImplementedError(
+            f'Function {name} is not supported.\n' + print_stack_trace(expr))
+    
+    # ===========================================================================
+    # control flow
+    # ===========================================================================
+    
+    def _density_control(self, expr, subs):
+        _, op = expr.etype
+        RDDLSimulator._check_op(op, self.CONTROL_OPS, 'Control', expr)
+        
+        if op == 'if':
+            return self._density_if(expr, subs)
+        else:
+            return self._density_switch(expr, subs)    
+        
+    def _density_if(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 3, 'If then else', expr)
+        
+        pred, arg1, arg2 = args
+        sample_pred = self._density(pred, subs)
+        RDDLSimulator._check_type(sample_pred, bool, 'If predicate', expr)
+        
+        # can short circuit if all elements of predicate tensor equal
+        first_elem = bool(sample_pred.flat[0] 
+                          if self.traced.cached_objects_in_scope(expr) 
+                          else sample_pred)
+        all_equal = np.all(sample_pred == first_elem)
+        
+        if all_equal:
+            arg = arg1 if first_elem else arg2
+            return self._density(arg, subs)
+        else:
+            sample_then = self._density(arg1, subs)
+            sample_else = self._density(arg2, subs)
+            return np.where(sample_pred, sample_then, sample_else)
+    
+    def _density_switch(self, expr, subs):
+        pred, *_ = expr.args             
+        sample_pred = self._density(pred, subs)
+        RDDLSimulator._check_type(
+            sample_pred, RDDLValueInitializer.INT, 'Switch predicate', expr)
+        
+        # can short circuit if all elements of predicate tensor equal
+        cases, default = self.traced.cached_sim_info(expr)  
+        first_elem = bool(sample_pred.flat[0] 
+                          if self.traced.cached_objects_in_scope(expr) 
+                          else sample_pred)
+        all_equal = np.all(sample_pred == first_elem)
+        
+        if all_equal:
+            arg = cases[first_elem]
+            if arg is None:
+                arg = default
+            return self._density(arg, subs)        
+        else: 
+            sample_def = None if default is None else self._density(default, subs)
+            sample_cases = np.asarray([
+                (sample_def if arg is None else self._density(arg, subs))
+                for arg in cases
+            ])
+            sample_pred = sample_pred[np.newaxis, ...]
+            sample = np.take_along_axis(sample_cases, sample_pred, axis=0)   
+            assert sample.shape[0] == 1
+            return sample[0, ...]
+        
+    # ===========================================================================
+    # random variables
+    # ===========================================================================
+    
+    def _density_random(self, expr, subs):
+        _, name = expr.etype
+        if name == 'KronDelta':
+            return self._density_kron_delta(expr, subs)        
+        elif name == 'DiracDelta':
+            return self._density_dirac_delta(expr, subs)
+        elif name == 'Uniform':
+            return self._density_uniform(expr, subs)
+        elif name == 'Bernoulli':
+            return self._density_bernoulli(expr, subs)
+        elif name == 'Normal':
+            return self._density_normal(expr, subs)
+        elif name == 'Poisson':
+            return self._density_poisson(expr, subs)
+        elif name == 'Exponential':
+            return self._density_exponential(expr, subs)
+        elif name == 'Weibull':
+            return self._density_weibull(expr, subs)        
+        elif name == 'Gamma':
+            return self._density_gamma(expr, subs)
+        elif name == 'Binomial':
+            return self._density_binomial(expr, subs)
+        elif name == 'NegativeBinomial':
+            return self._density_negative_binomial(expr, subs)
+        elif name == 'Beta':
+            return self._density_beta(expr, subs)
+        elif name == 'Geometric':
+            return self._density_geometric(expr, subs)
+        elif name == 'Pareto':
+            return self._density_pareto(expr, subs)
+        elif name == 'Student':
+            return self._density_student(expr, subs)
+        elif name == 'Gumbel':
+            return self._density_gumbel(expr, subs)
+        elif name == 'Laplace':
+            return self._density_laplace(expr, subs)
+        elif name == 'Cauchy':
+            return self._density_cauchy(expr, subs)
+        elif name == 'Gompertz':
+            return self._density_gompertz(expr, subs)
+        elif name == 'ChiSquare':
+            return self._density_chisquare(expr, subs)
+        elif name == 'Kumaraswamy':
+            return self._density_kumaraswamy(expr, subs)
+        elif name == 'Discrete':
+            return self._density_discrete(expr, subs, unnorm=False)
+        elif name == 'UnnormDiscrete':
+            return self._density_discrete(expr, subs, unnorm=True)
+        elif name == 'Discrete(p)':
+            return self._density_discrete_pvar(expr, subs, unnorm=False)
+        elif name == 'UnnormDiscrete(p)':
+            return self._density_discrete_pvar(expr, subs, unnorm=True)
+        else:
+            raise RDDLNotImplementedError(
+                f'Distribution {name} is not supported.\n' + 
+                print_stack_trace(expr))
+
+    def _density_kron_delta(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 1, 'KronDelta', expr)
+        
+        arg, = args
+        sample = self._density(arg, subs)
+        RDDLSimulator._check_types(
+            sample, (bool, RDDLValueInitializer.INT), 'Argument of KronDelta', expr)
+        return sample
+    
+    def _density_dirac_delta(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 1, 'DiracDelta', expr)
+        
+        arg, = args
+        sample = self._density(arg, subs)
+        RDDLSimulator._check_type(
+            sample, RDDLValueInitializer.REAL, 'Argument of DiracDelta', expr)        
+        return sample
+    
+    def _density_uniform(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Uniform', expr)
+
+        lb, ub = args
+        sample_lb = self._density(lb, subs)
+        sample_ub = self._density(ub, subs)
+        RDDLSimulator._check_bounds(sample_lb, sample_ub, 'Uniform', expr)
+        # return self.rng.uniform(low=sample_lb, high=sample_ub) 
+        param = {"Distribution": "Uniform", "Low": sample_lb, "High": sample_ub}
+        return param     
+    
+    def _density_bernoulli(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 1, 'Bernoulli', expr)
+        
+        pr, = args
+        sample_pr = self._density(pr, subs)
+        RDDLSimulator._check_range(sample_pr, 0, 1, 'Bernoulli p', expr)
+        # size = sample_pr.shape if self.traced.cached_objects_in_scope(expr) else None
+        # return self.rng.uniform(size=size) <= sample_pr
+        param = {"Distribution": "Bernoulli", "P": sample_pr}
+        return param
+    
+    def _density_normal(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Normal', expr)
+        
+        mean, var = args
+        sample_mean = self._density(mean, subs)
+        sample_var = self._density(var, subs)
+        RDDLSimulator._check_positive(sample_var, False, 'Normal variance', expr)  
+        sample_std = np.sqrt(sample_var)
+        # return self.rng.normal(loc=sample_mean, scale=sample_std)
+        param = {"Distribution": "Normal", "Mean": sample_mean, "Std": sample_std}
+        return param
+    
+    def _density_poisson(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 1, 'Poisson', expr)
+        
+        rate, = args
+        sample_rate = self._density(rate, subs)
+        RDDLSimulator._check_positive(sample_rate, False, 'Poisson rate', expr)        
+        # return self.rng.poisson(lam=sample_rate)
+        param = {"Distribution": "Poisson", "Rate": sample_rate}
+        return param
+    
+    def _density_exponential(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 1, 'Exponential', expr)
+        
+        scale, = expr.args
+        sample_scale = self._density(scale, subs)
+        RDDLSimulator._check_positive(sample_scale, True, 'Exponential rate', expr)
+        # return self.rng.exponential(scale=sample_scale)
+        param = {"Distribution": "Exponential", "Scale": sample_scale}
+        return param
+    
+    def _density_weibull(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Weibull', expr)
+        
+        shape, scale = args
+        sample_shape = self._density(shape, subs)
+        sample_scale = self._density(scale, subs)
+        RDDLSimulator._check_positive(sample_shape, True, 'Weibull shape', expr)
+        RDDLSimulator._check_positive(sample_scale, True, 'Weibull scale', expr)
+        # return sample_scale * self.rng.weibull(a=sample_shape)
+        param = {"Distribution": "Weibull", "Shape": sample_shape, "Scale": sample_scale}
+        return param
+    
+    def _density_gamma(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Gamma', expr)
+        
+        shape, scale = args
+        sample_shape = self._density(shape, subs)
+        sample_scale = self._density(scale, subs)
+        RDDLSimulator._check_positive(sample_shape, True, 'Gamma shape', expr)            
+        RDDLSimulator._check_positive(sample_scale, True, 'Gamma scale', expr)        
+        # return self.rng.gamma(shape=sample_shape, scale=sample_scale)
+        param = {"Distribution": "Gamma", "Shape": sample_shape, "Scale": sample_scale}
+        return param
+    
+    def _density_binomial(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Binomial', expr)
+        
+        count, pr = args
+        sample_count = self._density(count, subs)
+        sample_pr = self._density(pr, subs)
+        RDDLSimulator._check_type(sample_count, RDDLValueInitializer.INT, 'Binomial count', expr)
+        RDDLSimulator._check_positive(sample_count, False, 'Binomial count', expr)
+        RDDLSimulator._check_range(sample_pr, 0, 1, 'Binomial p', expr)
+        # return self.rng.binomial(n=sample_count, p=sample_pr)
+        param = {"Distribution": "Binomial", "Count": sample_count, "P": sample_pr}
+        return param
+    
+    def _density_negative_binomial(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'NegativeBinomial', expr)
+        
+        count, pr = args
+        sample_count = self._density(count, subs)
+        sample_pr = self._density(pr, subs)
+        RDDLSimulator._check_positive(sample_count, True, 'NegativeBinomial r', expr)
+        RDDLSimulator._check_range(sample_pr, 0, 1, 'NegativeBinomial p', expr)        
+        # return self.rng.negative_binomial(n=sample_count, p=sample_pr)
+        param = {"Distribution": "NegativeBinomial", "Count": sample_count, "P": sample_pr}
+        return param
+    
+    def _density_beta(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Beta', expr)
+        
+        shape, rate = args
+        sample_shape = self._density(shape, subs)
+        sample_rate = self._density(rate, subs)
+        RDDLSimulator._check_positive(sample_shape, True, 'Beta shape', expr)
+        RDDLSimulator._check_positive(sample_rate, True, 'Beta rate', expr)        
+        # return self.rng.beta(a=sample_shape, b=sample_rate)
+        param = {"Distribution": "Beta", "Shape": sample_shape, "Rate": sample_rate}
+        return param
+
+    def _density_geometric(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 1, 'Geometric', expr)
+        
+        pr, = args
+        sample_pr = self._density(pr, subs)
+        RDDLSimulator._check_range(sample_pr, 0, 1, 'Geometric p', expr)        
+        # return self.rng.geometric(p=sample_pr)
+        param = {"Distribution": "Geometric", "P": sample_pr}
+        return param
+    
+    def _density_pareto(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Pareto', expr)
+        
+        shape, scale = args
+        sample_shape = self._density(shape, subs)
+        sample_scale = self._density(scale, subs)
+        RDDLSimulator._check_positive(sample_shape, True, 'Pareto shape', expr)        
+        RDDLSimulator._check_positive(sample_scale, True, 'Pareto scale', expr)        
+        # return sample_scale * self.rng.pareto(a=sample_shape)
+        param = {"Distribution": "Pareto", "Shape": sample_shape, "Scale": sample_scale}
+        return param
+    
+    def _density_student(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 1, 'Student', expr)
+        
+        df, = args
+        sample_df = self._density(df, subs)
+        RDDLSimulator._check_positive(sample_df, True, 'Student df', expr)            
+        # return self.rng.standard_t(df=sample_df)
+        param = {"Distribution": "Student", "Df": sample_df}
+        return param
+
+    def _density_gumbel(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Gumbel', expr)
+        
+        mean, scale = args
+        sample_mean = self._density(mean, subs)
+        sample_scale = self._density(scale, subs)
+        RDDLSimulator._check_positive(sample_scale, True, 'Gumbel scale', expr)
+        # return self.rng.gumbel(loc=sample_mean, scale=sample_scale)
+        param = {"Distribution": "Gumbel", "Mean": sample_mean, "Scale": sample_scale}
+        return param
+    
+    def _density_laplace(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Laplace', expr)
+        
+        mean, scale = args
+        sample_mean = self._density(mean, subs)
+        sample_scale = self._density(scale, subs)
+        RDDLSimulator._check_positive(sample_scale, True, 'Laplace scale', expr)
+        # return self.rng.laplace(loc=sample_mean, scale=sample_scale)
+        param = {"Distribution": "Laplace", "Mean": sample_mean, "Scale": sample_scale}
+        return param
+    
+    def _density_cauchy(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Cauchy', expr)
+        
+        mean, scale = args
+        sample_mean = self._density(mean, subs)
+        sample_scale = self._density(scale, subs)
+        RDDLSimulator._check_positive(sample_scale, True, 'Cauchy scale', expr)
+        size = sample_mean.shape if self.traced.cached_objects_in_scope(expr) else None
+        cauchy01 = self.rng.standard_cauchy(size=size)
+        # return sample_mean + sample_scale * cauchy01
+        param = {"Distribution": "Cauchy", "Mean": sample_mean, "Scale": sample_scale}
+        return param
+    
+    def _density_gompertz(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Gompertz', expr)
+        
+        shape, scale = args
+        sample_shape = self._density(shape, subs)
+        sample_scale = self._density(scale, subs)
+        RDDLSimulator._check_positive(sample_shape, True, 'Gompertz shape', expr)
+        RDDLSimulator._check_positive(sample_scale, True, 'Gompertz scale', expr)
+        size = sample_shape.shape if self.traced.cached_objects_in_scope(expr) else None
+        U = self.rng.uniform(size=size)
+        # return np.log(1.0 - np.log1p(-U) / sample_shape) / sample_scale
+        param = {"Distribution": "Gompertz", "Shape": sample_shape, "Scale": sample_scale}
+        return param
+    
+    def _density_chisquare(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 1, 'ChiSquare', expr)
+        
+        df, = args
+        sample_df = self._density(df, subs)
+        RDDLSimulator._check_positive(sample_df, True, 'ChiSquare df', expr)
+        # return self.rng.chisquare(df=sample_df)
+        param = {"Distribution": "ChiSquare", "Df": sample_df}
+        return param
+    
+    def _density_kumaraswamy(self, expr, subs):
+        args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Kumaraswamy', expr)
+        
+        a, b = args
+        sample_a = self._density(a, subs)
+        sample_b = self._density(b, subs)
+        RDDLSimulator._check_positive(sample_a, True, 'Kumaraswamy a', expr)
+        RDDLSimulator._check_positive(sample_b, True, 'Kumaraswamy b', expr)
+        size = sample_a.shape if self.traced.cached_objects_in_scope(expr) else None
+        U = self.rng.uniform(size=size)
+        # return (1.0 - U ** (1.0 / sample_b)) ** (1.0 / sample_a)
+        param = {"Distribution": "Kumaraswamy", "A": sample_a, "B": sample_b}
+        return param
+    
+    # ===========================================================================
+    # random variables with enum support
+    # ===========================================================================
+    
+    def _density_discrete_helper(self, pdf, unnorm, expr):
+        RDDLSimulator._check_positive(pdf, False, 'Discrete probabilities', expr)
+        
+        # calculate CDF       
+        cdf = np.cumsum(pdf, axis=-1)
+        if unnorm:
+            cdf = cdf / cdf[..., -1:]
+            
+        # check valid CDF - still do this for unnorm to reject nan values
+        if not np.allclose(cdf[..., -1], 1.0):
+            raise RDDLValueOutOfRangeError(
+                f'Discrete probabilities must sum to 1, got {cdf[..., -1]}.\n' + 
+                print_stack_trace(expr))     
+        
+        # use inverse CDF sampling                  
+        U = self.rng.random(size=cdf.shape[:-1] + (1,))
+        return np.argmax(U < cdf, axis=-1)
+        
+    def _density_discrete(self, expr, subs, unnorm):
+        sorted_args = self.traced.cached_sim_info(expr)
+        samples = [self._density(arg, subs) for arg in sorted_args]
+        pdf = np.stack(samples, axis=-1)
+        param = {"Distribution": "Discrete", "Pdf": pdf}
+        return param
+        # return self._density_discrete_helper(pdf, unnorm, expr)
+    
+    def _density_discrete_pvar(self, expr, subs, unnorm):
+        _, args = expr.args
+        arg, = args
+        pdf = self._density(arg, subs)
+        param = {"Distribution": "Discrete", "Pdf": pdf}
+        return param
+        # return self._density_discrete_helper(pdf, unnorm, expr)
+               
+    # ===========================================================================
+    # random vectors
+    # ===========================================================================
+    
+    def _density_random_vector(self, expr, subs):
+        _, name = expr.etype
+        if name == 'MultivariateNormal':
+            return self._density_multivariate_normal(expr, subs)
+        elif name == 'MultivariateStudent':
+            return self._density_multivariate_student(expr, subs)
+        elif name == 'Dirichlet':
+            return self._density_dirichlet(expr, subs)
+        elif name == 'Multinomial':
+            return self._density_multinomial(expr, subs)
+        else:
+            raise RDDLNotImplementedError(
+                f'Multivariate distribution {name} is not supported.\n' + 
+                print_stack_trace(expr))
+    
+    def _density_multivariate_normal(self, expr, subs):
+        _, args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'MultivariateNormal', expr)
+        
+        mean, cov = args
+        sample_mean = self._density(mean, subs)
+        sample_cov = self._density(cov, subs)
+        
+        # reparameterization trick MN(m, LL') = LZ + m, where Z ~ Normal(0, 1)
+        L = np.linalg.cholesky(sample_cov)
+        Z = self.rng.standard_normal(
+            size=sample_mean.shape + (1,),
+            dtype=RDDLValueInitializer.REAL)
+        sample = np.matmul(L, Z)[..., 0] + sample_mean
+
+        # since the sampling is done in the last dimension we need to move it
+        # to match the order of the CPF variables
+        index, = self.traced.cached_sim_info(expr)
+        sample = np.moveaxis(sample, source=-1, destination=index)
+        param = {"Distribution": "MultivariateNormal", "Mean": sample_mean, "Cov": sample_cov}
+        # return sample
+        return param
+    
+    def _density_multivariate_student(self, expr, subs):
+        _, args = expr.args
+        RDDLSimulator._check_arity(args, 3, 'MultivariateStudent', expr)
+        
+        mean, cov, df = args
+        sample_mean = self._density(mean, subs)
+        sample_cov = self._density(cov, subs)
+        sample_df = self._density(df, subs)
+        RDDLSimulator._check_positive(sample_df, True, 'MultivariateStudent df', expr)
+        
+        # reparameterization trick MN(m, LL') = LZ + m, where Z ~ StudentT(0, 1)
+        sample_df = sample_df[..., np.newaxis, np.newaxis]
+        sample_df = np.broadcast_to(sample_df, shape=sample_mean.shape + (1,))
+        L = np.linalg.cholesky(sample_cov)
+        Z = self.rng.standard_t(df=sample_df)
+        sample = np.matmul(L, Z)[..., 0] + sample_mean
+        
+        # since the sampling is done in the last dimension we need to move it
+        # to match the order of the CPF variables
+        index, = self.traced.cached_sim_info(expr)
+        sample = np.moveaxis(sample, source=-1, destination=index)
+        param = {"Distribution": "MultivariateStudent", "Mean": sample_mean, "Cov": sample_cov, "Df": sample_df}
+        # return sample
+        return param
+    
+    def _density_dirichlet(self, expr, subs):
+        _, args = expr.args
+        RDDLSimulator._check_arity(args, 1, 'Dirichlet', expr)
+        
+        alpha, = args
+        sample_alpha = self._density(alpha, subs)
+        
+        # sample Gamma(alpha_i, 1) and normalize across i
+        RDDLSimulator._check_positive(sample_alpha, True, 'Dirichlet alpha', expr)
+        Gamma = self.rng.gamma(shape=sample_alpha, scale=1.0)
+        sample = Gamma / np.sum(Gamma, axis=-1, keepdims=True)
+        
+        # since the sampling is done in the last dimension we need to move it
+        # to match the order of the CPF variables
+        index, = self.traced.cached_sim_info(expr)
+        sample = np.moveaxis(sample, source=-1, destination=index)
+        param = {"Distribution": "Dirichlet", "Alpha": sample_alpha}
+        # return sample
+        return param
+    
+    def _density_multinomial(self, expr, subs):
+        _, args = expr.args
+        RDDLSimulator._check_arity(args, 2, 'Multinomial', expr)
+        
+        trials, prob = args
+        sample_trials = self._density(trials, subs) 
+        sample_prob = self._density(prob, subs)       
+        RDDLSimulator._check_type(sample_trials, RDDLValueInitializer.INT, 'Multinomial trials', expr)
+        RDDLSimulator._check_positive(sample_trials, False, 'Multinomial trials', expr)
+        RDDLSimulator._check_positive(sample_prob, False, 'Discrete probabilities', expr)
+        
+        # check valid PMF
+        cum_prob = np.sum(sample_prob, axis=-1)
+        if not np.allclose(cum_prob, 1.0):
+            raise RDDLValueOutOfRangeError(
+                f'Multinomial probabilities must sum to 1, got {cum_prob}.\n' + 
+                print_stack_trace(expr))    
+            
+        # sample from the multinomial
+        sample = self.rng.multinomial(n=sample_trials, pvals=sample_prob)
+        
+        # since the sampling is done in the last dimension we need to move it
+        # to match the order of the CPF variables
+        index, = self.traced.cached_sim_info(expr)
+        sample = np.moveaxis(sample, source=-1, destination=index)
+        param = {"Distribution": "Multinomial", "Trials": sample_trials, "Prob": sample_prob}
+        # return sample
+        return param
+        
+    # ===========================================================================
+    # matrix algebra
+    # ===========================================================================
+    
+    def _density_matrix(self, expr, subs):
+        _, op = expr.etype
+        if op == 'det':
+            return self._density_matrix_det(expr, subs)
+        elif op == 'inverse':
+            return self._density_matrix_inv(expr, subs, pseudo=False)
+        elif op == 'pinverse':
+            return self._density_matrix_inv(expr, subs, pseudo=True)
+        else:
+            raise RDDLNotImplementedError(
+                f'Matrix operator {op} is not supported.\n' + 
+                print_stack_trace(expr))
+    
+    def _density_matrix_det(self, expr, subs):
+        * _, arg = expr.args
+        sample_arg = self._density(arg, subs)
+        return np.linalg.det(sample_arg)
+    
+    def _density_matrix_inv(self, expr, subs, pseudo):
+        _, arg = expr.args
+        sample_arg = self._density(arg, subs)
+        op = np.linalg.pinv if pseudo else np.linalg.inv
+        sample = op(sample_arg)
+        
+        # matrix dimensions are last two axes, move them to the correct position
+        indices = self.traced.cached_sim_info(expr)
+        sample = np.moveaxis(sample, source=(-2, -1), destination=indices)
+        return sample       
+    
     
 def lngamma(x):
     xmin = np.min(x)
